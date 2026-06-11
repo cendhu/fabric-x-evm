@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
+	"log"
 	"math/big"
 	"math/rand"
 	"os"
@@ -170,6 +171,7 @@ func (sp *StatePrimer) LoadFromJSON(jsonFilePath string) (*StatePrimer, error) {
 		return sp, nil
 	}
 
+	log.Printf("StatePrimer: reading alloc JSON from %s", jsonFilePath)
 	data, err := os.ReadFile(jsonFilePath)
 	if err != nil {
 		return nil, err
@@ -179,6 +181,7 @@ func (sp *StatePrimer) LoadFromJSON(jsonFilePath string) (*StatePrimer, error) {
 	if err := json.Unmarshal(data, &alloc); err != nil {
 		return nil, err
 	}
+	log.Printf("StatePrimer: loaded %d alloc entries", len(alloc))
 
 	for addrStr, entry := range alloc {
 		addr := common.HexToAddress(addrStr)
@@ -217,6 +220,7 @@ func (sp *StatePrimer) LoadFromJSON(jsonFilePath string) (*StatePrimer, error) {
 		sp.SetAccount(addr, nonce, code, balance, storage)
 	}
 
+	log.Printf("StatePrimer: alloc JSON applied to simulation state")
 	return sp, nil
 }
 
@@ -225,11 +229,13 @@ func (sp *StatePrimer) LoadFromJSON(jsonFilePath string) (*StatePrimer, error) {
 func (sp *StatePrimer) Commit(ctx context.Context, wait bool) error {
 	defer sp.reader.Close()
 
+	log.Printf("StatePrimer: Commit start wait=%t", wait)
 	// create a fake ethereum tx so we can use it to track priming
 	tx, ethTxBytes, err := sp.fakeEthTx()
 	if err != nil {
 		return err
 	}
+	log.Printf("StatePrimer: fake tx created hash=%s", tx.Hash().Hex())
 
 	// Create a proposal for the priming transaction
 	prop, err := network.NewSignedProposal(
@@ -250,13 +256,16 @@ func (sp *StatePrimer) Commit(ctx context.Context, wait bool) error {
 
 	// Collect endorsements from all builders
 	var presps []*pb.ProposalResponse
+	result := sp.stateDB.Result()
+	log.Printf("StatePrimer: endorsing priming proposal with %d builders", len(sp.builders))
 	for _, builder := range sp.builders {
-		presp, err := builder.Endorse(inv, endorsement.Success(sp.stateDB.Result(), nil, nil))
+		presp, err := builder.Endorse(inv, endorsement.Success(result, nil, nil))
 		if err != nil {
 			return err
 		}
 		presps = append(presps, presp)
 	}
+	log.Printf("StatePrimer: collected %d priming endorsements", len(presps))
 
 	return sp.commitAndWait(sdk.Endorsement{
 		Responses: presps,
@@ -327,16 +336,20 @@ func (sp *StatePrimer) fakeEthTx() (*types.Transaction, []byte, error) {
 
 func (sp *StatePrimer) commitAndWait(end sdk.Endorsement, tx *types.Transaction, wait bool) error {
 	if wait {
+		log.Printf("StatePrimer: submitting priming tx through gateway")
 		// submit through the gateway (asynchronous)
 		if err := sp.gw.SubmitFabricTx(context.Background(), end); err != nil {
 			return err
 		}
+		log.Printf("StatePrimer: priming tx submitted through gateway")
 	} else {
+		log.Printf("StatePrimer: submitting priming tx directly")
 		// Submit directly via the submitter (synchronous) instead of via gateway (async BatchSubmitter)
 		// This ensures priming completes before the test continues
 		if err := sp.submitter.Submit(context.Background(), end); err != nil {
 			return err
 		}
+		log.Printf("StatePrimer: priming tx submitted directly")
 	}
 
 	ec, err := NewNativeEthClient(sp.gw)
@@ -345,7 +358,9 @@ func (sp *StatePrimer) commitAndWait(end sdk.Endorsement, tx *types.Transaction,
 	}
 
 	if wait {
+		log.Printf("StatePrimer: waiting for priming tx commit hash=%s", tx.Hash().Hex())
 		waitForCommit(context.Background(), ec, tx)
+		log.Printf("StatePrimer: priming tx commit observed hash=%s", tx.Hash().Hex())
 	}
 
 	return nil

@@ -9,6 +9,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
@@ -20,16 +21,21 @@ import (
 
 var batchLogger = flogging.MustGetLogger("gateway.core.batch_submitter")
 
+type SubmitTimingObserver interface {
+	BatchSubmitFinished(duration time.Duration, err error)
+}
+
 // BatchSubmitter reads endorsements from a channel, optionally records them in the
 // pending-tx cache (when cache != nil), then submits each one to the orderer.
 // The cache is used by AllTxBatchDispatcher to correlate commit events with the
 // originating Ethereum transaction.
 type BatchSubmitter struct {
-	submitter Submitter
-	cache     *PendingTxCache // nil → skip cache; non-nil → store EthTxBytes keyed by FabricTxID
-	inputChan chan sdk.Endorsement
-	stopChan  chan struct{}
-	doneChan  chan struct{}
+	submitter            Submitter
+	cache                *PendingTxCache // nil → skip cache; non-nil → store EthTxBytes keyed by FabricTxID
+	inputChan            chan sdk.Endorsement
+	stopChan             chan struct{}
+	doneChan             chan struct{}
+	submitTimingObserver atomic.Value // stores SubmitTimingObserver
 }
 
 // NewBatchSubmitter creates a new BatchSubmitter.
@@ -46,6 +52,18 @@ func NewBatchSubmitter(
 		stopChan:  make(chan struct{}),
 		doneChan:  make(chan struct{}),
 	}
+}
+
+func (bs *BatchSubmitter) SetSubmitTimingObserver(observer SubmitTimingObserver) {
+	bs.submitTimingObserver.Store(observer)
+}
+
+func (bs *BatchSubmitter) submitObserver() SubmitTimingObserver {
+	observer := bs.submitTimingObserver.Load()
+	if observer == nil {
+		return nil
+	}
+	return observer.(SubmitTimingObserver)
 }
 
 // Start begins the submission loop in a goroutine.
@@ -94,7 +112,11 @@ func (bs *BatchSubmitter) submitOne(ctx context.Context, end sdk.Endorsement) er
 	}
 	t0 := time.Now()
 	err := bs.submitter.Submit(ctx, end)
-	batchLogger.Debugf("[SUBMIT] txid=%s submit_took=%v", txid, time.Since(t0))
+	duration := time.Since(t0)
+	if observer := bs.submitObserver(); observer != nil {
+		observer.BatchSubmitFinished(duration, err)
+	}
+	batchLogger.Debugf("[SUBMIT] txid=%s submit_took=%v", txid, duration)
 	return err
 }
 

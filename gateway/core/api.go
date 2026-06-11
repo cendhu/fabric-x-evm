@@ -13,6 +13,8 @@ import (
 	"math"
 	"math/big"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -33,6 +35,15 @@ type Signer interface {
 type Submitter interface {
 	Submit(context.Context, sdk.Endorsement) error
 	Close() error
+}
+
+type ProcessTimingObserver interface {
+	ProcessStarted()
+	EndorsementStarted()
+	EndorsementFinished(duration time.Duration, err error)
+	SubmitStarted()
+	SubmitFinished(duration time.Duration, err error)
+	ProcessFinished(duration time.Duration, err error)
 }
 
 // TxQueueInterface defines the interface that transaction queue implementations must satisfy.
@@ -65,17 +76,18 @@ var logger = flogging.MustGetLogger("gateway.core")
 // contract, the gateway requests endorsement from a set of EVM endorsers. It then
 // submits a signed transaction with the read/writeset to the Fabric orderers.
 type Gateway struct {
-	submitter       Submitter
-	endorsers       *EndorsementClient
-	store           Store
-	chainID         *big.Int
-	ChainConfig     *params.ChainConfig
-	Signer          types.Signer
-	TxQueue         TxQueueInterface
-	workerCount     int
-	wg              sync.WaitGroup
-	stopOnce        sync.Once
-	endorsementChan chan sdk.Endorsement // Channel to send endorsements to BatchSubmitter
+	submitter             Submitter
+	endorsers             *EndorsementClient
+	store                 Store
+	chainID               *big.Int
+	ChainConfig           *params.ChainConfig
+	Signer                types.Signer
+	TxQueue               TxQueueInterface
+	workerCount           int
+	wg                    sync.WaitGroup
+	stopOnce              sync.Once
+	endorsementChan       chan sdk.Endorsement // Channel to send endorsements to BatchSubmitter
+	processTimingObserver atomic.Value         // stores ProcessTimingObserver
 }
 
 type Store interface {
@@ -121,6 +133,18 @@ func New(ec *EndorsementClient, submitter Submitter, store Store, chainID int64,
 	}, nil
 }
 
+func (g *Gateway) SetProcessTimingObserver(observer ProcessTimingObserver) {
+	g.processTimingObserver.Store(observer)
+}
+
+func (g *Gateway) processObserver() ProcessTimingObserver {
+	observer := g.processTimingObserver.Load()
+	if observer == nil {
+		return nil
+	}
+	return observer.(ProcessTimingObserver)
+}
+
 // Start initializes the worker pool to process transactions from the queue
 func (g *Gateway) Start(ctx context.Context) {
 	for range g.workerCount {
@@ -150,12 +174,39 @@ func (g *Gateway) worker(ctx context.Context) {
 
 // processTx handles the actual transaction processing
 func (g *Gateway) processTx(ctx context.Context, tx *types.Transaction) error {
+	observer := g.processObserver()
+	processStart := time.Now()
+	if observer != nil {
+		observer.ProcessStarted()
+		observer.EndorsementStarted()
+	}
+
+	endorsementStart := time.Now()
 	end, err := g.ExecuteEthTx(ctx, tx)
+	if observer != nil {
+		observer.EndorsementFinished(time.Since(endorsementStart), err)
+	}
 	if err != nil {
+		if observer != nil {
+			observer.ProcessFinished(time.Since(processStart), err)
+		}
 		return err
 	}
+
+	if observer != nil {
+		observer.SubmitStarted()
+	}
+	submitStart := time.Now()
 	if err := g.SubmitFabricTx(ctx, end); err != nil {
+		if observer != nil {
+			observer.SubmitFinished(time.Since(submitStart), err)
+			observer.ProcessFinished(time.Since(processStart), err)
+		}
 		return err
+	}
+	if observer != nil {
+		observer.SubmitFinished(time.Since(submitStart), nil)
+		observer.ProcessFinished(time.Since(processStart), nil)
 	}
 
 	return nil

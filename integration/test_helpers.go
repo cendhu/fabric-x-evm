@@ -190,7 +190,7 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 	}
 
 	// Create BatchSubmitter infrastructure
-	endorsementChan := make(chan sdk.Endorsement, 1000)
+	endorsementChan := make(chan sdk.Endorsement, 10000)
 	batchSubmitter := core.NewBatchSubmitter(submitter, cache, endorsementChan)
 
 	batchSubmitter.Start(t.Context())
@@ -247,24 +247,35 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 			logger.Infof("Synchronizer stopped cleanly")
 
 			// Set up AllTxStreamer notification system
-			txHandlers := make([]core.TxHandler, 0, len(dbs)+3)
-			for _, db := range dbs {
-				txHandlers = append(txHandlers, db.(core.TxHandler))
+			var notifMetrics *notificationReceiverMetrics
+			if notificationReceiverMetricsEnabled() {
+				notifMetrics = newNotificationReceiverMetrics()
+				go notifMetrics.LogPeriodically(t.Context(), 2*time.Second, logger)
 			}
-			txHandlers = append(txHandlers, store.(core.TxHandler))
-			txHandlers = append(txHandlers, gw.TxQueue.(core.TxHandler))
+
+			txHandlers := make([]core.TxHandler, 0, len(dbs)+3)
+			for i, db := range dbs {
+				txHandlers = append(txHandlers, notifMetrics.WrapTxHandler(fmt.Sprintf("db[%d]", i), db.(core.TxHandler)))
+			}
+			txHandlers = append(txHandlers, notifMetrics.WrapTxHandler("store", store.(core.TxHandler)))
+			txHandlers = append(txHandlers, notifMetrics.WrapTxHandler("txqueue", gw.TxQueue.(core.TxHandler)))
 			if extraHandler != nil {
-				txHandlers = append(txHandlers, extraHandler)
+				txHandlers = append(txHandlers, notifMetrics.WrapTxHandler("extra", extraHandler))
 			}
 
 			dispatcher := core.NewAllTxBatchDispatcher(cache, txHandlers...)
+			notificationHandler := notifMetrics.WrapAllTxHandler("AllTxBatchDispatcher.HandleBatch", dispatcher)
 
 			if cfg.Network.Protocol == "fabric-x" || cfg.Network.Protocol == "" {
 				peer, err := nfabx.NewPeer(cfg.Gateway.Committer.ToPeerConf(), cfg.Network.Channel, gwSigner)
 				if err != nil {
 					return nil, nil, fmt.Errorf("create notification peer: %w", err)
 				}
-				streamer := notification.NewAllTxStreamer(peer, []notification.AllTxHandler{dispatcher}, logger)
+				var streamPeer notification.AllTxPeer = peer
+				if notifMetrics != nil {
+					streamPeer = measuredAllTxPeer{peer: peer, metrics: notifMetrics}
+				}
+				streamer := notification.NewAllTxStreamer(streamPeer, []notification.AllTxHandler{notificationHandler}, logger)
 				go func() {
 					req := &notification.StreamAllRequest{
 						FilterNamespaces:     []string{cfg.Network.Namespace},
@@ -284,26 +295,33 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 	}
 
 	// Start gateway worker pool
+	logger.Infof("Starting gateway worker pool")
 	gw.Start(t.Context())
 	t.Cleanup(func() { gw.Stop() })
+	logger.Infof("Gateway worker pool started")
 
 	// Create state primer
+	logger.Infof("Creating state primer")
 	primer, err := NewStatePrimer(gw, submitter, dbs[0], cfg.Network.Namespace, gwSigner, builders, cfg.Network.Channel, cfg.Network.NsVersion, cfg.Network.Protocol == "fabric-x")
 	if err != nil {
 		return nil, nil, err
 	}
+	logger.Infof("State primer created")
 
 	th := &TestHarness{
-		Gateways:       []*core.Gateway{gw},
-		endorsers:      ends,
-		ethChainConfig: evmConfig.ChainConfig,
-		Primer:         primer,
-		DBs:            dbs,
+		Gateways:        []*core.Gateway{gw},
+		BatchSubmitters: []*core.BatchSubmitter{batchSubmitter},
+		endorsers:       ends,
+		ethChainConfig:  evmConfig.ChainConfig,
+		Primer:          primer,
+		DBs:             dbs,
 	}
 
+	logger.Infof("Priming state from %s (wait=%t)", primeDBPath, !bypass)
 	if err := th.PrimeStateFromJSON(t.Context(), primeDBPath, !bypass); err != nil {
 		return nil, nil, err
 	}
+	logger.Infof("State priming complete")
 
 	return th, sync, nil
 }
@@ -637,11 +655,12 @@ func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, ev
 // TestHarness provides access to gateways and endorsers for testing.
 // Exported for use by eth-tests package.
 type TestHarness struct {
-	DBs            []endorser.KVS
-	Gateways       []*core.Gateway
-	endorsers      []core.Endorser
-	ethChainConfig *params.ChainConfig
-	Primer         *StatePrimer
+	DBs             []endorser.KVS
+	Gateways        []*core.Gateway
+	BatchSubmitters []*core.BatchSubmitter
+	endorsers       []core.Endorser
+	ethChainConfig  *params.ChainConfig
+	Primer          *StatePrimer
 }
 
 func (th *TestHarness) Stop() error {

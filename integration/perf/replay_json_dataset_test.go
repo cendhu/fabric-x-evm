@@ -13,9 +13,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,13 +25,16 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/hyperledger/fabric-x-common/api/committerpb"
 	"github.com/hyperledger/fabric-x-evm/endorser"
 	econf "github.com/hyperledger/fabric-x-evm/endorser/config"
 	"github.com/hyperledger/fabric-x-evm/endorser/testimpl"
 	gwcore "github.com/hyperledger/fabric-x-evm/gateway/core"
+	"github.com/hyperledger/fabric-x-evm/gateway/domain"
 	gwtestimpl "github.com/hyperledger/fabric-x-evm/gateway/testimpl"
 	"github.com/hyperledger/fabric-x-evm/integration"
+	"github.com/hyperledger/fabric-x-evm/integration/contracts"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/grpclog"
@@ -91,6 +96,8 @@ func balancePrimingEndorserFactory(balancePriming *testimpl.BalancePrimingConfig
 	}
 }
 
+const defaultReplayDatasetPath = "testdata/synthetic_usdc_400k.tsv.gz"
+
 type replayConfig struct {
 	// windowSize is the number of transfers to use from the dataset.
 	// 0 means use the entire dataset.
@@ -108,6 +115,308 @@ type replayConfig struct {
 	// totalDispatches is the total number of transfers to dispatch when
 	// wrapAround is true. Ignored when wrapAround is false.
 	totalDispatches int64
+}
+
+type replayTxQueueMetricsSnapshot struct {
+	DequeueCount       int64
+	DequeueWaitTotal   time.Duration
+	DequeueWaitMax     time.Duration
+	HandleTxCount      int64
+	HandleTxBatchTotal int64
+	HandleTxTotal      time.Duration
+	HandleTxMax        time.Duration
+}
+
+type replayTxQueueMetrics struct {
+	queue gwcore.TxQueueInterface
+
+	mu                 sync.Mutex
+	dequeueCount       int64
+	dequeueWaitTotal   time.Duration
+	dequeueWaitMax     time.Duration
+	handleTxCount      int64
+	handleTxBatchTotal int64
+	handleTxTotal      time.Duration
+	handleTxMax        time.Duration
+}
+
+func newReplayTxQueueMetrics(queue gwcore.TxQueueInterface) *replayTxQueueMetrics {
+	return &replayTxQueueMetrics{queue: queue}
+}
+
+func (m *replayTxQueueMetrics) Enqueue(tx *types.Transaction) {
+	m.queue.Enqueue(tx)
+}
+
+func (m *replayTxQueueMetrics) Dequeue() (*types.Transaction, bool) {
+	start := time.Now()
+	tx, ok := m.queue.Dequeue()
+	wait := time.Since(start)
+
+	m.mu.Lock()
+	m.dequeueCount++
+	m.dequeueWaitTotal += wait
+	if wait > m.dequeueWaitMax {
+		m.dequeueWaitMax = wait
+	}
+	m.mu.Unlock()
+
+	return tx, ok
+}
+
+func (m *replayTxQueueMetrics) IsPending(txHash common.Hash) *types.Transaction {
+	return m.queue.IsPending(txHash)
+}
+
+func (m *replayTxQueueMetrics) Close() {
+	m.queue.Close()
+}
+
+func (m *replayTxQueueMetrics) Handle(ctx context.Context, block *domain.Block) error {
+	return m.queue.Handle(ctx, block)
+}
+
+func (m *replayTxQueueMetrics) Stats() (int, int, int, int) {
+	return m.queue.Stats()
+}
+
+func (m *replayTxQueueMetrics) HandleTx(ctx context.Context, notifs []gwcore.TxNotification) error {
+	handler, ok := m.queue.(gwcore.TxHandler)
+	if !ok {
+		return fmt.Errorf("wrapped queue %T does not implement TxHandler", m.queue)
+	}
+
+	start := time.Now()
+	err := handler.HandleTx(ctx, notifs)
+	elapsed := time.Since(start)
+
+	m.mu.Lock()
+	m.handleTxCount++
+	m.handleTxBatchTotal += int64(len(notifs))
+	m.handleTxTotal += elapsed
+	if elapsed > m.handleTxMax {
+		m.handleTxMax = elapsed
+	}
+	m.mu.Unlock()
+
+	return err
+}
+
+func (m *replayTxQueueMetrics) SnapshotAndReset() replayTxQueueMetricsSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	snapshot := replayTxQueueMetricsSnapshot{
+		DequeueCount:       m.dequeueCount,
+		DequeueWaitTotal:   m.dequeueWaitTotal,
+		DequeueWaitMax:     m.dequeueWaitMax,
+		HandleTxCount:      m.handleTxCount,
+		HandleTxBatchTotal: m.handleTxBatchTotal,
+		HandleTxTotal:      m.handleTxTotal,
+		HandleTxMax:        m.handleTxMax,
+	}
+	m.dequeueCount = 0
+	m.dequeueWaitTotal = 0
+	m.dequeueWaitMax = 0
+	m.handleTxCount = 0
+	m.handleTxBatchTotal = 0
+	m.handleTxTotal = 0
+	m.handleTxMax = 0
+	return snapshot
+}
+
+type replayGatewayProcessMetricsSnapshot struct {
+	ProcessStarted  int64
+	ProcessFinished int64
+	ProcessErrors   int64
+	ProcessTotal    time.Duration
+	ProcessMax      time.Duration
+	EndorseCount    int64
+	EndorseErrors   int64
+	EndorseTotal    time.Duration
+	EndorseMax      time.Duration
+	SubmitCount     int64
+	SubmitErrors    int64
+	SubmitTotal     time.Duration
+	SubmitMax       time.Duration
+	ActiveProcess   int64
+	ActiveEndorse   int64
+	ActiveSubmit    int64
+}
+
+type replayGatewayProcessMetrics struct {
+	mu sync.Mutex
+
+	processStarted  int64
+	processFinished int64
+	processErrors   int64
+	processTotal    time.Duration
+	processMax      time.Duration
+	endorseCount    int64
+	endorseErrors   int64
+	endorseTotal    time.Duration
+	endorseMax      time.Duration
+	submitCount     int64
+	submitErrors    int64
+	submitTotal     time.Duration
+	submitMax       time.Duration
+	activeProcess   int64
+	activeEndorse   int64
+	activeSubmit    int64
+}
+
+func (m *replayGatewayProcessMetrics) ProcessStarted() {
+	m.mu.Lock()
+	m.processStarted++
+	m.activeProcess++
+	m.mu.Unlock()
+}
+
+func (m *replayGatewayProcessMetrics) EndorsementStarted() {
+	m.mu.Lock()
+	m.activeEndorse++
+	m.mu.Unlock()
+}
+
+func (m *replayGatewayProcessMetrics) EndorsementFinished(duration time.Duration, err error) {
+	m.mu.Lock()
+	m.endorseCount++
+	m.endorseTotal += duration
+	if duration > m.endorseMax {
+		m.endorseMax = duration
+	}
+	if err != nil {
+		m.endorseErrors++
+	}
+	if m.activeEndorse > 0 {
+		m.activeEndorse--
+	}
+	m.mu.Unlock()
+}
+
+func (m *replayGatewayProcessMetrics) SubmitStarted() {
+	m.mu.Lock()
+	m.activeSubmit++
+	m.mu.Unlock()
+}
+
+func (m *replayGatewayProcessMetrics) SubmitFinished(duration time.Duration, err error) {
+	m.mu.Lock()
+	m.submitCount++
+	m.submitTotal += duration
+	if duration > m.submitMax {
+		m.submitMax = duration
+	}
+	if err != nil {
+		m.submitErrors++
+	}
+	if m.activeSubmit > 0 {
+		m.activeSubmit--
+	}
+	m.mu.Unlock()
+}
+
+func (m *replayGatewayProcessMetrics) ProcessFinished(duration time.Duration, err error) {
+	m.mu.Lock()
+	m.processFinished++
+	m.processTotal += duration
+	if duration > m.processMax {
+		m.processMax = duration
+	}
+	if err != nil {
+		m.processErrors++
+	}
+	if m.activeProcess > 0 {
+		m.activeProcess--
+	}
+	m.mu.Unlock()
+}
+
+func (m *replayGatewayProcessMetrics) SnapshotAndReset() replayGatewayProcessMetricsSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	snapshot := replayGatewayProcessMetricsSnapshot{
+		ProcessStarted:  m.processStarted,
+		ProcessFinished: m.processFinished,
+		ProcessErrors:   m.processErrors,
+		ProcessTotal:    m.processTotal,
+		ProcessMax:      m.processMax,
+		EndorseCount:    m.endorseCount,
+		EndorseErrors:   m.endorseErrors,
+		EndorseTotal:    m.endorseTotal,
+		EndorseMax:      m.endorseMax,
+		SubmitCount:     m.submitCount,
+		SubmitErrors:    m.submitErrors,
+		SubmitTotal:     m.submitTotal,
+		SubmitMax:       m.submitMax,
+		ActiveProcess:   m.activeProcess,
+		ActiveEndorse:   m.activeEndorse,
+		ActiveSubmit:    m.activeSubmit,
+	}
+	m.processStarted = 0
+	m.processFinished = 0
+	m.processErrors = 0
+	m.processTotal = 0
+	m.processMax = 0
+	m.endorseCount = 0
+	m.endorseErrors = 0
+	m.endorseTotal = 0
+	m.endorseMax = 0
+	m.submitCount = 0
+	m.submitErrors = 0
+	m.submitTotal = 0
+	m.submitMax = 0
+	return snapshot
+}
+
+type replayBatchSubmitMetricsSnapshot struct {
+	Count  int64
+	Errors int64
+	Total  time.Duration
+	Max    time.Duration
+}
+
+type replayBatchSubmitMetrics struct {
+	mu     sync.Mutex
+	count  int64
+	errors int64
+	total  time.Duration
+	max    time.Duration
+}
+
+func (m *replayBatchSubmitMetrics) BatchSubmitFinished(duration time.Duration, err error) {
+	m.mu.Lock()
+	m.count++
+	m.total += duration
+	if duration > m.max {
+		m.max = duration
+	}
+	if err != nil {
+		m.errors++
+	}
+	m.mu.Unlock()
+}
+
+func (m *replayBatchSubmitMetrics) SnapshotAndReset() replayBatchSubmitMetricsSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	snapshot := replayBatchSubmitMetricsSnapshot{
+		Count:  m.count,
+		Errors: m.errors,
+		Total:  m.total,
+		Max:    m.max,
+	}
+	m.count = 0
+	m.errors = 0
+	m.total = 0
+	m.max = 0
+	return snapshot
+}
+
+func durationMillis(d time.Duration) float64 {
+	return float64(d) / float64(time.Millisecond)
 }
 
 func loadReplayConfigFromEnv(t *testing.T) replayConfig {
@@ -139,6 +448,73 @@ func loadReplayConfigFromEnv(t *testing.T) replayConfig {
 	}
 
 	return cfg
+}
+
+func loadReplayWindowFromPath(t *testing.T, datasetPath string, cfg replayConfig) []TokenTransfer {
+	t.Helper()
+
+	transfers, needsTransactions := loadReplayDatasetFromPath(t, datasetPath)
+	window := transfers
+	if cfg.windowSize > 0 && cfg.windowSize < len(transfers) {
+		window = transfers[:cfg.windowSize]
+	}
+	if needsTransactions {
+		assert.NoError(t, populateReplayTransactions(t.Context(), window))
+	}
+	return window
+}
+
+func loadReplayDatasetFromPath(t *testing.T, datasetPath string) ([]TokenTransfer, bool) {
+	t.Helper()
+
+	if strings.HasSuffix(datasetPath, ".tsv.gz") {
+		transfers, err := ParseTSVGZ(datasetPath)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, transfers, "dataset should contain transfers")
+		return transfers, true
+	}
+
+	file, err := os.Open(datasetPath)
+	assert.NoError(t, err)
+	defer file.Close()
+
+	gzReader, err := gzip.NewReader(file)
+	assert.NoError(t, err)
+	defer gzReader.Close()
+
+	var transfers []TokenTransfer
+	decoder := json.NewDecoder(gzReader)
+	err = decoder.Decode(&transfers)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, transfers, "dataset should contain transfers")
+	return transfers, false
+}
+
+func populateReplayTransactions(ctx context.Context, transfers []TokenTransfer) error {
+	nonceTracker := NewNonceTracker()
+	chainConfig := *params.AllEthashProtocolChanges
+	chainConfig.ChainID = big.NewInt(4011)
+
+	for i := range transfers {
+		transfer := &transfers[i]
+		ethSender, err := integration.NewEthClientFromAddress(transfer.Sender, contracts.FiatTokenV22MetaData, &chainConfig)
+		if err != nil {
+			return fmt.Errorf("transfer %d: create eth client for sender %s: %w", i, transfer.Sender.Hex(), err)
+		}
+
+		mappedRecipient := mapAddress(transfer.Recipient)
+		tx, err := ethSender.TxForCall(ctx, nonceTracker, &usdcAddress, "transfer", mappedRecipient, transfer.Value.ToBig())
+		if err != nil {
+			return fmt.Errorf("transfer %d: create transaction: %w", i, err)
+		}
+
+		transfer.Transaction, err = tx.MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("transfer %d: marshal transaction: %w", i, err)
+		}
+	}
+
+	return nil
 }
 
 //lint:ignore U1000 kept for future tests / debugging
@@ -198,39 +574,25 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 	// - Local: Traditional block-based synchronization
 	// - Fabric: Traditional block-based synchronization
 	// - Fabric-X: Notification-based (MemoryStore + NotificationDispatcher)
-	// th, err := integration.NewLocalTestHarnessWithFactoryAndTxQueue(t, integration.TestLogger{T: t}, evmConfig, "testdata/USDC_contract.json", "fabric", map[string]any{"Gateway.WorkerCount": processingWorkerCount}, factory, gwcore.NewTxQueueV2())
-	th, err := integration.NewFabricXTestHarnessWithNotifications(t, integration.TestLogger{T: t}, evmConfig, "testdata/USDC_contract.json", map[string]any{"Gateway.WorkerCount": processingWorkerCount}, factory, gwcore.NewTxQueueV2(), tracker)
-	// th, err = integration.NewFabricTestHarnessWithFactoryAndTxQueue(t, integration.TestLogger{T: t}, evmConfig, "testdata/USDC_contract.json", map[string]any{"Gateway.WorkerCount": processingWorkerCount}, factory, gwcore.NewTxQueueV2())
+	txQueueMetrics := newReplayTxQueueMetrics(gwcore.NewTxQueueV2())
+	gatewayProcessMetrics := &replayGatewayProcessMetrics{}
+	batchSubmitMetrics := &replayBatchSubmitMetrics{}
+	// th, err := integration.NewLocalTestHarnessWithFactoryAndTxQueue(t, integration.TestLogger{T: t}, evmConfig, "testdata/USDC_contract.json", "fabric", map[string]any{"Gateway.WorkerCount": processingWorkerCount}, factory, txQueueMetrics)
+	th, err := integration.NewFabricXTestHarnessWithNotifications(t, integration.TestLogger{T: t}, evmConfig, "testdata/USDC_contract.json", map[string]any{"Gateway.WorkerCount": processingWorkerCount}, factory, txQueueMetrics, tracker)
+	// th, err = integration.NewFabricTestHarnessWithFactoryAndTxQueue(t, integration.TestLogger{T: t}, evmConfig, "testdata/USDC_contract.json", map[string]any{"Gateway.WorkerCount": processingWorkerCount}, factory, txQueueMetrics)
 	assert.NoError(t, err)
+	th.Gateways[0].SetProcessTimingObserver(gatewayProcessMetrics)
+	th.BatchSubmitters[0].SetSubmitTimingObserver(batchSubmitMetrics)
 
 	// Wrap the gateway with NonceBypassGateway to skip nonce validation
 	// This is necessary for wrap-around replay where the same transactions are replayed
 	wrappedGateway := gwtestimpl.NewNonceBypassGateway(th.Gateways[0])
 
-	// Load the JSON dataset
-	datasetPath := "testdata/USDC_dataset.json.gz"
-	t.Logf("Loading dataset from %s", datasetPath)
+	// Load the replay dataset.
+	t.Logf("Loading dataset from %s", defaultReplayDatasetPath)
+	window := loadReplayWindowFromPath(t, defaultReplayDatasetPath, cfg)
 
-	file, err := os.Open(datasetPath)
-	assert.NoError(t, err)
-	defer file.Close()
-
-	gzReader, err := gzip.NewReader(file)
-	assert.NoError(t, err)
-	defer gzReader.Close()
-
-	var allTransfers []TokenTransfer
-	decoder := json.NewDecoder(gzReader)
-	err = decoder.Decode(&allTransfers)
-	assert.NoError(t, err)
-	assert.NotEmpty(t, allTransfers, "dataset should contain transfers")
-
-	t.Logf("Loaded %d transfers from dataset", len(allTransfers))
-
-	window := allTransfers
-	if cfg.windowSize > 0 && cfg.windowSize < len(allTransfers) {
-		window = allTransfers[:cfg.windowSize]
-	}
+	t.Logf("Loaded %d transfers from dataset window", len(window))
 
 	if cfg.wrapAround && cfg.wrapCount > 0 {
 		cfg.totalDispatches = int64(len(window)) * cfg.wrapCount
@@ -336,10 +698,49 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 					progressTarget = cfg.totalDispatches
 				}
 
-				t.Logf("Progress: %d/%d transfers processed (%d successful, %d failed, %d skipped, %d outstanding) | Throughput: %.2f tx/s (recent), %.2f tx/s (overall)",
+				queueMetrics := txQueueMetrics.SnapshotAndReset()
+				processMetrics := gatewayProcessMetrics.SnapshotAndReset()
+				batchMetrics := batchSubmitMetrics.SnapshotAndReset()
+
+				dequeueWaitAvg := time.Duration(0)
+				if queueMetrics.DequeueCount > 0 {
+					dequeueWaitAvg = queueMetrics.DequeueWaitTotal / time.Duration(queueMetrics.DequeueCount)
+				}
+				handleTxAvg := time.Duration(0)
+				handleTxBatchAvg := float64(0)
+				if queueMetrics.HandleTxCount > 0 {
+					handleTxAvg = queueMetrics.HandleTxTotal / time.Duration(queueMetrics.HandleTxCount)
+					handleTxBatchAvg = float64(queueMetrics.HandleTxBatchTotal) / float64(queueMetrics.HandleTxCount)
+				}
+				processAvg := time.Duration(0)
+				if processMetrics.ProcessFinished > 0 {
+					processAvg = processMetrics.ProcessTotal / time.Duration(processMetrics.ProcessFinished)
+				}
+				endorseAvg := time.Duration(0)
+				if processMetrics.EndorseCount > 0 {
+					endorseAvg = processMetrics.EndorseTotal / time.Duration(processMetrics.EndorseCount)
+				}
+				submitEnqueueAvg := time.Duration(0)
+				if processMetrics.SubmitCount > 0 {
+					submitEnqueueAvg = processMetrics.SubmitTotal / time.Duration(processMetrics.SubmitCount)
+				}
+				batchSubmitAvg := time.Duration(0)
+				if batchMetrics.Count > 0 {
+					batchSubmitAvg = batchMetrics.Total / time.Duration(batchMetrics.Count)
+				}
+
+				t.Logf("Progress: %d/%d transfers processed (%d successful, %d failed, %d skipped, %d outstanding) | Throughput: %.2f tx/s (recent), %.2f tx/s (overall) | gateway process n=%d done=%d err=%d active(p/e/s)=%d/%d/%d avg/max=%.3f/%.3fms endorse n=%d err=%d avg/max=%.3f/%.3fms enqueue n=%d err=%d avg/max=%.3f/%.3fms batch_submit n=%d err=%d avg/max=%.3f/%.3fms queue_dequeue n=%d avg/max=%.3f/%.3fms handle_tx batches=%d avg_batch=%.1f avg/max=%.3f/%.3fms",
 					currentSuccess+currentFail+currentSkipped, progressTarget,
 					currentSuccess, currentFail, currentSkipped, currentOutstanding,
-					throughput, overallThroughput)
+					throughput, overallThroughput,
+					processMetrics.ProcessStarted, processMetrics.ProcessFinished, processMetrics.ProcessErrors,
+					processMetrics.ActiveProcess, processMetrics.ActiveEndorse, processMetrics.ActiveSubmit,
+					durationMillis(processAvg), durationMillis(processMetrics.ProcessMax),
+					processMetrics.EndorseCount, processMetrics.EndorseErrors, durationMillis(endorseAvg), durationMillis(processMetrics.EndorseMax),
+					processMetrics.SubmitCount, processMetrics.SubmitErrors, durationMillis(submitEnqueueAvg), durationMillis(processMetrics.SubmitMax),
+					batchMetrics.Count, batchMetrics.Errors, durationMillis(batchSubmitAvg), durationMillis(batchMetrics.Max),
+					queueMetrics.DequeueCount, durationMillis(dequeueWaitAvg), durationMillis(queueMetrics.DequeueWaitMax),
+					queueMetrics.HandleTxCount, handleTxBatchAvg, durationMillis(handleTxAvg), durationMillis(queueMetrics.HandleTxMax))
 
 				// Update for next interval
 				lastLogTime.Store(now)
@@ -467,8 +868,8 @@ func TestReplayJSONDataset(t *testing.T) {
 	}
 	// flogging.ActivateSpec("gateway.core.txqueue_v2=debug")
 
-	// Run the test with single worker configuration
-	_, _, _ = runReplayTest(t, 1, 1, 100, loadReplayConfigFromEnv(t))
+	// Run the test with 64 processors, 1 submitter, and 2000 outstanding transactions.
+	_, _, _ = runReplayTest(t, 64, 1, 2000, loadReplayConfigFromEnv(t))
 }
 
 type performanceResult struct {
@@ -489,8 +890,8 @@ func TestReplayJSONDatasetPerformance(t *testing.T) {
 	}
 
 	// Define the range of worker counts to test
-	processingWorkerCounts := []int{1, 4, 8}
-	submittingWorkerCounts := []int{4, 8, 16, 24}
+	processingWorkerCounts := []int{64}
+	submittingWorkerCounts := []int{1}
 
 	// Store results
 	var results []performanceResult
@@ -503,7 +904,7 @@ func TestReplayJSONDatasetPerformance(t *testing.T) {
 			t.Logf("\n=== Testing with processingWorkers=%d, submittingWorkers=%d ===",
 				processingWorkers, submittingWorkers)
 
-			throughput, failedTxs, totalTxs := runReplayTest(t, processingWorkers, submittingWorkers, 100, loadReplayConfigFromEnv(t))
+			throughput, failedTxs, totalTxs := runReplayTest(t, processingWorkers, submittingWorkers, 1000, loadReplayConfigFromEnv(t))
 			failureRate := float64(failedTxs) / float64(totalTxs)
 
 			results = append(results, performanceResult{

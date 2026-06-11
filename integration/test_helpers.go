@@ -536,9 +536,13 @@ func NewFabricXTestHarnessWithFactory(t *testing.T, logger sdk.Logger, evmConfig
 }
 
 func NewFabricXTestHarnessWithFactoryAndTxQueue(t *testing.T, logger sdk.Logger, evmConfig endorser.EVMConfig, primeDbPath string, configOverrides map[string]any, factory EndorserFactory, txQueue core.TxQueueInterface) (*TestHarness, error) {
-	cfg, err := config.Load("fabx.yaml")
+	configPath := os.Getenv("FABX_CONFIG_PATH")
+	if configPath == "" {
+		configPath = "fabx.yaml"
+	}
+	cfg, err := config.Load(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("load config: %w", err)
+		return nil, fmt.Errorf("load config %q: %w", configPath, err)
 	}
 
 	if err := applyConfigOverrides(&cfg, configOverrides); err != nil {
@@ -575,9 +579,13 @@ func NewFabricXTestHarnessWithNotifications(t *testing.T, logger sdk.Logger, evm
 	defer os.Chdir(cwd)
 	_ = os.Chdir("../")
 
-	cfg, err := config.Load("fabx.yaml")
+	configPath := os.Getenv("FABX_CONFIG_PATH")
+	if configPath == "" {
+		configPath = "fabx.yaml"
+	}
+	cfg, err := config.Load(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("load config: %w", err)
+		return nil, fmt.Errorf("load config %q: %w", configPath, err)
 	}
 
 	if err := applyConfigOverrides(&cfg, configOverrides); err != nil {

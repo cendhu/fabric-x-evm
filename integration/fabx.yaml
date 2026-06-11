@@ -13,6 +13,7 @@ logging:
 
 gateway:
   listen: "0.0.0.0:8545"
+  worker-count: 64
 
   identity:
     msp-id: Org1MSP

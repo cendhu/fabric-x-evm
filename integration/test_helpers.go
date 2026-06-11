@@ -160,6 +160,7 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 	var submitter core.Submitter
 	var sync *network.Synchronizer
 	var err1 error
+	var sidecarPeer *nfabx.Peer
 
 	if bypass {
 		// Use local submitter for bypass mode (no network communication)
@@ -271,6 +272,7 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 				if err != nil {
 					return nil, nil, fmt.Errorf("create notification peer: %w", err)
 				}
+				sidecarPeer = peer
 				var streamPeer notification.AllTxPeer = peer
 				if notifMetrics != nil {
 					streamPeer = measuredAllTxPeer{peer: peer, metrics: notifMetrics}
@@ -315,6 +317,7 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 		ethChainConfig:  evmConfig.ChainConfig,
 		Primer:          primer,
 		DBs:             dbs,
+		BlockHeightPeer: sidecarPeer,
 	}
 
 	logger.Infof("Priming state from %s (wait=%t)", primeDBPath, !bypass)
@@ -661,6 +664,7 @@ type TestHarness struct {
 	endorsers       []core.Endorser
 	ethChainConfig  *params.ChainConfig
 	Primer          *StatePrimer
+	BlockHeightPeer *nfabx.Peer
 }
 
 func (th *TestHarness) Stop() error {

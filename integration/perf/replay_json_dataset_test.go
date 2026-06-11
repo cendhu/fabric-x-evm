@@ -742,6 +742,13 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 					queueMetrics.DequeueCount, durationMillis(dequeueWaitAvg), durationMillis(queueMetrics.DequeueWaitMax),
 					queueMetrics.HandleTxCount, handleTxBatchAvg, durationMillis(handleTxAvg), durationMillis(queueMetrics.HandleTxMax))
 
+				// Poll committer block height
+				if th.BlockHeightPeer != nil {
+					if bh, err := th.BlockHeightPeer.BlockHeight(context.Background()); err == nil {
+						t.Logf("Committer block height: %d", bh)
+					}
+				}
+
 				// Update for next interval
 				lastLogTime.Store(now)
 				lastLogCount = currentTotal
